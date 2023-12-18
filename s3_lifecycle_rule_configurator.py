@@ -6,48 +6,48 @@ This script manages S3 bucket lifecycle rules, automating the application of spe
 It allows users to append lifecycle rules to existing buckets, ensuring modularity and ease of use without creating
 IAM roles or attaching policies.
 """
+from typing import Iterable
+
 import boto3
 
 
-def get_s3_client() -> boto3.client:
-    """
-    Creates an S3 client.
-
-    :return: S3 client.
-    :rtype: boto3.client
-    """
-    return boto3.client('s3')
-
-
-def check_existing_mpu_rule(current_rules: list) -> bool:
-    """
-    Checks if an existing rule for incomplete multipart upload deletion is present.
-
-    :param current_rules: Current lifecycle rules for the bucket.
-    :type current_rules: list
-    :return: True if a rule for deleting incomplete multipart uploads exists, False otherwise.
-    :rtype: bool
-    """
-    for rule in current_rules:
-        if 'AbortIncompleteMultipartUpload' in rule:
-            return True
-    return False
-
-
-def list_buckets(s3_client: boto3.client):
+def list_buckets(s3_client: boto3.client) -> dict[str, list]:
     """
     Lists buckets using an S3 client.
 
     :param s3_client: The S3 client.
     :type s3_client: boto3.client
     :return: List of bucket names.
-    :rtype: list
+    :rtype: dict[str, list]
     """
-    response = s3_client.list_buckets()
-    return [bucket['Name'] for bucket in response['Buckets']]
+    # Get the list of bucket names and their regions
+    names = [bucket['Name'] for bucket in s3_client.list_buckets()['Buckets']]
+    regions = [s3_client.get_bucket_location(Bucket=b)['LocationConstraint'] or 'us-east-1' for b in names]
+
+    # Construct a dictionary mapping the buckets for each region
+    buckets = {}
+    for region in set(regions):
+        buckets[region] = [name for i, name in enumerate(names) if regions[i] == region]
+
+    return buckets
 
 
-def get_current_lifecycle(s3_client: boto3.client, bucket_name: str):
+def is_region_opt_in(account_client: boto3.client, region: str) -> bool:
+    """
+    Determine whether the given region is opt-in
+
+    :param account_client: The account client.
+    :type account_client: boto3.client
+    :param region: The iterable with the regions to check.
+    :type region: Iterable
+    :return: Flag indicating whether the region is opt-in
+    :rtype: bool
+    """
+    status = account_client.get_region_opt_status(RegionName=region).get('RegionOptStatus', 'ENABLED')
+    return status != 'ENABLED_BY_DEFAULT'
+
+
+def get_current_lifecycle(s3_client: boto3.client, bucket_name: str) -> list[dict]:
     """
     Gets the current lifecycle configuration for a bucket.
 
@@ -81,7 +81,8 @@ def check_and_append_lifecycle_rule(s3_client: boto3.client, bucket_name: str, c
     :param new_lifecycle_rule: The new lifecycle rule to be appended.
     :type new_lifecycle_rule: dict
     """
-    if rule_id_exists(current_rules, new_lifecycle_rule['ID']):
+    # Add the policy if its ID is not already present in the bucket rules
+    if any([new_lifecycle_rule['ID'] == rule['ID'] for rule in current_rules]):
         print(f"Policy '{new_lifecycle_rule['ID']}' already exists in bucket '{bucket_name}'. No action taken.")
     else:
         current_rules.append(new_lifecycle_rule)
@@ -92,46 +93,36 @@ def check_and_append_lifecycle_rule(s3_client: boto3.client, bucket_name: str, c
         print(f"Appended new lifecycle rule to bucket {bucket_name}")
 
 
-def rule_id_exists(current_rules: list, new_rule_name: str) -> bool:
-    """
-    Checks if a rule ID already exists among the current rules.
-
-    :param current_rules: List of current lifecycle rules.
-    :type current_rules: list
-    :param new_rule_name: The ID of the new rule to check for existence.
-    :type new_rule_name: str
-    :return: True if the rule ID already exists, False otherwise.
-    :rtype: bool
-    """
-    for rule in current_rules:
-        if new_rule_name == rule['ID']:
-            return True
-    return False
-
-
 def main():
     """
     Orchestrates the setup of S3 bucket lifecycle rules.
     """
-    s3_client = get_s3_client()
+    global_s3_client = boto3.client('s3')
+    account_client = boto3.client('account')
     new_lifecycle_rule = {
         "ID": "delete-incomplete-mpu-7days",
         "Status": "Enabled",
         "Filter": {"Prefix": ""},
         "AbortIncompleteMultipartUpload": {"DaysAfterInitiation": 7}
     }
-    buckets = list_buckets(s3_client)
+    buckets = list_buckets(global_s3_client)
 
-    for bucket_name in buckets:
-        current_rules = get_current_lifecycle(s3_client, bucket_name)
+    for region, bucket_names in buckets.items():
+        # Opt-in regions require us to use regional endpoints
+        # We'll use the global one with the rest of regions for efficiency
+        s3_client = global_s3_client
+        if is_region_opt_in(account_client, region):
+            s3_client = boto3.client('s3', region_name=region)
 
-        # Check if an existing policy for incomplete multipart uploads deletion exists
-        existing_mpu_policy = check_existing_mpu_rule(current_rules)
-        if existing_mpu_policy:
-            print(f"Bucket '{bucket_name}' already has a policy to delete incomplete multipart uploads.")
-        else:
-            # No existing policy found, add the new lifecycle rule
-            check_and_append_lifecycle_rule(s3_client, bucket_name, current_rules, new_lifecycle_rule)
+        for bucket_name in bucket_names:
+            current_rules = get_current_lifecycle(s3_client, bucket_name)
+
+            # Add the multipart-related rule if not already present
+            if any(['AbortIncompleteMultipartUpload' in rule for rule in current_rules]):
+                print(f"Bucket '{bucket_name}' already has a policy to delete incomplete multipart uploads.")
+            else:
+                # No existing policy found, add the new lifecycle rule
+                check_and_append_lifecycle_rule(s3_client, bucket_name, current_rules, new_lifecycle_rule)
 
     print("Script completed successfully.")
 
